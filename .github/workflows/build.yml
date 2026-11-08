@@ -17,7 +17,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: cloudcord-mod/hub
-          ref: 927165a26a81e0133e5301220a915a07d6c1b33d
+          ref: 6163b22ea4e2062800ce9581f061541590a9b473
           persist-credentials: false
       - name: Check out platform source
         uses: actions/checkout@v4
