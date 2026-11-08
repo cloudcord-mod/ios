@@ -1,0 +1,72 @@
+import { initBotCordSwitcher } from "@core/ui/botcord/FloatingSwitcher";
+import patchErrorBoundary from "@core/debug/patches/patchErrorBoundary";
+import initFixes from "@core/fixes";
+import { initFetchI18nStrings } from "@core/i18n";
+import initSettings from "@core/ui/settings";
+import { initVendettaObject } from "@core/vendetta/api";
+import { VdPluginManager } from "@core/vendetta/plugins";
+import { updateFonts } from "@lib/addons/fonts";
+import { initThemes } from "@lib/addons/themes";
+import { initPlugins, updatePlugins } from "@lib/addons/plugins";
+import { patchCommands } from "@lib/api/commands";
+import { patchLogHook } from "@lib/api/debug";
+import { initLegacyRuntimeRefresh } from "@lib/api/native/legacyRuntimeRefresh";
+import { injectFluxInterceptor } from "@lib/api/flux";
+import { patchJsx } from "@lib/api/react/jsx";
+import { logger } from "@lib/utils/logger";
+import { patchSettings } from "@ui/settings";
+import { initDebugger } from "@lib/api/debug";
+
+import * as lib from "./lib";
+
+export default async () => {
+    if ((globalThis as any).__CLOUDCORD_ORIGINAL_RAIN__) {
+        const prefs = require("@lib/api/settings").settings;
+        void require("@core/vendetta/storage").awaitStorage(prefs).then(() => {
+            const updater = require("@lib/api/native/modules").BundleUpdaterManager;
+            lib.unload.push(require("@lib/api/native/runtimeUpdates").startAutoUpdates(prefs, updater));
+        }).catch((error: unknown) => console.warn("CloudCord update check failed", error));
+    }
+    // Updating an older loader must never hold settings registration hostage
+    // to native storage or the reload bridge. Defer even synchronous failures.
+    if (!(globalThis as any).__CLOUDCORD_BRIDGELESS__) {
+        void Promise.resolve().then(() => initLegacyRuntimeRefresh()).catch(error => {
+            console.warn("CloudCord legacy update check failed", error);
+        });
+    }
+
+    // Load everything in parallel. The shared build workflow wraps core
+    // settings separately and applies the version-specific fallbacks.
+    await Promise.all([
+        initThemes(),
+        updateFonts(),
+        injectFluxInterceptor(),
+        patchSettings(),
+        patchLogHook(),
+        patchCommands(),
+        patchJsx(),
+        initVendettaObject(),
+        initFetchI18nStrings(),
+        initSettings(),
+        initBotCordSwitcher(),
+        initFixes(),
+        patchErrorBoundary(),
+        updatePlugins(),
+        initPlugins(),
+        VdPluginManager.initPlugins(),
+    ]).then(
+        u => u.forEach(f => f && lib.unload.push(f))
+    );
+
+    initDebugger()
+
+    // Assign window object
+    window.bunny = lib;
+
+    // We good :)
+    // Discord's Logger may suppress info output in production. Emit the same
+    // completion point to the native console for launch verification.
+    console.log("CloudCord is ready!");
+    logger.log("CloudCord is ready!");
+
+};

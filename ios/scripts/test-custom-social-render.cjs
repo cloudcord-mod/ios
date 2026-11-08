@@ -1,0 +1,33 @@
+const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
+const path=require('node:path'),{createRequire}=require('node:module');
+const esbuild=require(process.env.CLOUDCORD_ESBUILD || 'esbuild');
+const workflow=fs.readFileSync('.github/workflows/cloudcord.yml','utf8');
+const page=workflow.split("cat > src/core/ui/settings/pages/FakeProfile/index.tsx <<'TSX'")[1].split('\n          TSX')[0].replace(/^          /gm,'');
+assert.ok(!page.includes('CustomSocialList'),'separate profile social sections removed');
+const hooks=new Map(),routes=[];
+const runtime={jsx(){},jsxs(){}};
+const createElement=(type,props)=>({type,props});
+const context=vm.createContext({createElement,React:{createElement},findByProps:()=>runtime,after:(method,object,hook)=>hooks.set(method,hook),isValidElement:node=>!!node?.type,cloneElement:(node,changes)=>({...node,props:{...node.props,...changes}}),NavigationNative:{useNavigation:()=>({push:(...args)=>routes.push(args)})},require:()=>({CustomSocialDetail:function Detail(){}})});
+const source=page.slice(page.indexOf('const socialRenderers ='),page.indexOf('function replaceIdentityText('));
+vm.runInContext(esbuild.transformSync(source,{loader:'tsx'}).code,context);
+context.connectNativeSocialRenderer();
+for(const name of ['jsx','jsxs']) {
+    const originalPress=()=>{};
+    let nativeCalls=0;
+    const Native=function(props){nativeCalls++;return {type:'native-row',props};};
+    const ordinary={type:Native,props:{user:{id:'real'},onPress:originalPress}};
+    assert.equal(hooks.get(name)([Native],ordinary),ordinary,'ordinary native entries remain untouched');
+    const entry={id:'custom',username:'Preview'};
+    const custom={type:Native,props:{user:{cloudcordPreview:entry}}};
+    const wrapped=hooks.get(name)([Native],custom);
+    const rendered=wrapped.type(wrapped.props);
+    assert.equal(rendered.type,Native,'React retains ownership of the original component and its hooks');
+    assert.equal(nativeCalls,0,'wrapper must not invoke the native component');
+    rendered.props.onPress();
+    rendered.props.onClick();
+    rendered.props.onOpenProfile();
+    assert.equal(routes.at(-1)[0],'PUPU_CUSTOM_PAGE');
+    const detail=routes.at(-1)[1].render();
+    assert.equal(detail.props.entry,entry);
+}
+console.log('Mobile native social routing: preserves native layout and ordinary entries; custom presses open detail (simulated renderer)');
