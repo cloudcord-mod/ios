@@ -2,7 +2,7 @@ import { onEditMessage, onSendMessage } from "@core/plugins/shared/sendMessage";
 import { instead } from "@lib/api/patcher";
 import { animateCxAssets, bindCxSocialEvents, createCxPlusReactionHandler, createCxPreviousSendHandler, createCxSession, createCxSplitSender, cxAppearanceTargets, cxProfileMenuActions, CX_INLINE_EDITOR_LIMIT, filterCxEmojiAutocomplete, fixCxFileExtensions, floorCxRelativeTime, formatCxRandomMember, formatCxRoleMembers, formatCxSpotify, getCxProfileMenuCopy, isCxProfileUserId, markCxServersRead, MAX_CX_SOURCE, overrideCxMethods, raiseCxAvatarResolution, reviewCx, runCxFriendInvites, runCxIncomingRules, type CxProfileMenuAction, type CxUploadAnonymiser } from "@lib/api/cx";
 import { createCxVoicePing, createCxVoiceCount, isCxVoiceCountChannel, isCxVoiceCountFull, type CxVoiceCountChannel, type CxVoiceCountOptions } from "@lib/api/cx";
-import { bindCxCameraTone, createCxVoiceQueue, getCxImageSearchOptions, getCxSteamLink, getCxVoiceQueueRoom, type CxSearchMediaSource, type CxVoiceQueueOptions } from "@lib/api/cx";
+import { bindCxCameraTone, bindCxMutedVoice, createCxVoiceQueue, getCxImageSearchOptions, getCxSteamLink, getCxVoiceQueueRoom, type CxSearchMediaSource, type CxVoiceQueueOptions } from "@lib/api/cx";
 import { cxCatalog } from "@lib/api/cxCatalog";
 import { bindCxChannelOpenRead, filterCxEmojiCategories, isCxNotificationMuted, type CxMessageAlert } from "@lib/api/cx";
 import { buildCxRepeatMessage, getCxEmbedToggle, getCxPinAction, getCxSpotifySongName, sortCxReactions, type CxRepeatMessage, type CxSpotifyActivity } from "@lib/api/cx";
@@ -1838,6 +1838,10 @@ function registerProfileMedia() {
     return () => { active = false; stop(); };
 }
 
+function supportsMobileHide({ target }: { target: keyof typeof cxAppearanceTargets; }) {
+    return !("desktopOnly" in cxAppearanceTargets[target]);
+}
+
 export default function CxExtensions() {
     const [source, setSource] = React.useState("");
     const [showCatalog, setShowCatalog] = React.useState(false);
@@ -1852,7 +1856,8 @@ export default function CxExtensions() {
         setCandidate(undefined);
         try {
             const preview = reviewCx(next);
-            setCandidate({ source: next, review: preview, selected: preview.appearanceOptions.filter(option => option.defaultOn).map(option => option.target) });
+            setCandidate({ source: next, review: preview, selected: preview.appearanceOptions
+                .filter(option => option.defaultOn && supportsMobileHide(option)).map(option => option.target) });
             setStatus("");
         } catch (error) {
             setStatus(String(error instanceof Error ? error.message : error));
@@ -1945,6 +1950,7 @@ export default function CxExtensions() {
                 registerSendConfirmation,
                 registerTimestampFormats,
                 hideAppearanceTarget(target) {
+                    if (!supportsMobileHide({ target })) return () => {};
                     const mobile = cxAppearanceTargets[target].mobile;
                     if ("renderTree" in mobile || "renderComponent" in mobile) return registerTreeAppearance(mobile);
                     if ("tableRow" in mobile) {
@@ -2147,6 +2153,13 @@ export default function CxExtensions() {
                             return registerNoRoleHeaders();
                         case "show-voice-ping":
                             return registerVoicePing(enabled);
+                        case "notify-when-muted": {
+                            const sound = findByFilePath("modules/sound_playback/native/SoundUtils.tsx");
+                            if (typeof sound?.playSound !== "function" || !effectOptions || !("serverMute" in effectOptions))
+                                throw new Error("Discord's mute alert controls are unavailable");
+                            return bindCxMutedVoice(findByStoreName("MediaEngineStore"), () => Boolean(SelectedChannelStore.getVoiceChannelId()),
+                                () => { void Promise.resolve(sound.playSound("user_leave")).catch(() => {}); }, effectOptions, enabled);
+                        }
                         case "voice-channel-count":
                             if (!effectOptions || !("showEmpty" in effectOptions)) throw new Error("Missing voice count options");
                             return registerVoiceChannelCount(effectOptions, enabled);
@@ -2508,6 +2521,20 @@ export default function CxExtensions() {
                                 reply: message => {
                                     if (!settings.safeMode?.enabled && context.channel?.id) messageUtil.sendBotMessage(context.channel.id, message);
                                 },
+                                prepareChannel() {
+                                    const channelId = context.channel?.id;
+                                    const accountId = UserStore?.getCurrentUser?.()?.id;
+                                    if (!channelId || !accountId) return;
+                                    const isCurrent = () => !settings.safeMode?.enabled && UserStore?.getCurrentUser?.()?.id === accountId;
+                                    return {
+                                        reply(content) { if (isCurrent()) messageUtil.sendBotMessage(channelId, content); },
+                                        async send(content) {
+                                            if (!isCurrent()) return;
+                                            if (!ChannelStore?.getChannel(channelId)) throw new Error("The original channel is unavailable");
+                                            await messageUtil.sendMessage(channelId, { content });
+                                        },
+                                    };
+                                },
                                 lookup(name, input) {
                                     if (name === "roleMembers" || name === "randomMember") {
                                         const guild = context.guild?.id ?? ChannelStore?.getChannel?.(context.channel?.id)?.guild_id;
@@ -2614,14 +2641,14 @@ export default function CxExtensions() {
                     label={candidate.review.name}
                     subLabel={[...candidate.review.effects, ...(candidate.review.commands ?? [])].join("\n")}
                 />}
-                {candidate?.review.appearanceOptions.map(({ target, label }) => <TableSwitchRow key={target}
+                {candidate?.review.appearanceOptions.filter(supportsMobileHide).map(({ target, label }) => <TableSwitchRow key={target}
                     label={label} value={candidate.selected.includes(target)} onValueChange={(checked: boolean) => {
                         setCandidate({ ...candidate, selected: selectCxAppearanceOption(candidate.selected, target, checked) });
                     }} />)}
                 {candidate && <TableRow label="Allow for this session" onPress={enable} />}
                 {candidate && !source && <TableRow label="Edit CX source" onPress={() => setSource(candidate.source)} />}
                 {session.list().flatMap(({ id, name }) => [
-                    ...session.appearanceOptions(id).map(({ target, label, enabled }) => <TableSwitchRow key={`${id}:${target}`}
+                    ...session.appearanceOptions(id).filter(supportsMobileHide).map(({ target, label, enabled }) => <TableSwitchRow key={`${id}:${target}`}
                         label={`${name} · ${label}`} value={enabled} onValueChange={(checked: boolean) => {
                             try {
                                 session.setAppearanceOption(id, target, checked);

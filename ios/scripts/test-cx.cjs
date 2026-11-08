@@ -14,15 +14,24 @@ const code = buildSync({
     bundle: true, write: false, format: "cjs", minify: true,
 }).outputFiles[0].text;
 let wikiRequest;
+let translateRequest;
 let clockTime;
 const clockTimers = new Set();
+const scheduleTimers = new Map();
 vm.runInNewContext(code, {
-    module: moduleBox, AbortController, setTimeout, clearTimeout,
+    module: moduleBox, AbortController,
+    setTimeout(callback, delay) {
+        if (delay < 60_000) return setTimeout(callback, delay);
+        scheduleTimers.set(callback, delay);
+        return callback;
+    },
+    clearTimeout(timer) { if (!scheduleTimers.delete(timer)) clearTimeout(timer); },
     Date: class extends Date { static now() { return clockTime ?? Date.now(); } },
     setInterval: callback => { clockTimers.add(callback); return callback; },
     clearInterval: callback => clockTimers.delete(callback),
     fetch: (url, options) => new Promise((resolve, reject) => {
-        wikiRequest = { url, options, resolve };
+        if (url.startsWith("https://translate.googleapis.com/")) translateRequest = { url, options, resolve };
+        else wikiRequest = { url, options, resolve };
         options.signal.addEventListener("abort", () => reject(new Error("Aborted")), { once: true });
     }),
 });
@@ -250,10 +259,12 @@ console.log("PASS CX permission review, denial, revocation, rollback, plugin and
         const previousEdits = [];
         const jumps = [];
         const composerActions = [];
+        const scheduledSends = [];
+        let activeAccount = me;
         const messageEditor = { editMessage: (channel, id, message) => previousEdits.push([channel, id, message.content]),
             jumpToMessage: target => jumps.push(target),
             startEditMessage: (channel, id, content) => composerActions.push(["edit", id, content]),
-            sendMessage: (...args) => repeated.push(args) };
+            sendMessage: (...args) => args[0] === "scheduled-channel" ? scheduledSends.push(args) : repeated.push(args) };
         const gestureChannel = "129876543219876543";
         const gestureMessages = new Map([
             [me, { id: me, author: { id: me }, content: "my message", type: 0, channel_id: gestureChannel, state: "SENT" }],
@@ -346,7 +357,17 @@ console.log("PASS CX permission review, denial, revocation, rollback, plugin and
             emitChange() { motionUpdates++; }
         }
         let voicePingMs, voicePingChannel, voicePingConnected;
+        let speakingWhileMuted = false, selfMuted = false, serverMuted = false, selfDeafened = false;
+        const mediaListeners = new Set();
         const stores = {
+            MediaEngineStore: {
+                getSpeakingWhileMuted: () => speakingWhileMuted,
+                isMute: () => selfMuted || serverMuted,
+                isSelfMute: () => selfMuted,
+                isSelfDeaf: () => selfDeafened,
+                addChangeListener: callback => mediaListeners.add(callback),
+                removeChangeListener: callback => mediaListeners.delete(callback),
+            },
             RTCConnectionStore: {
                 getLastPing: () => voicePingMs,
                 getChannelId: () => voicePingChannel,
@@ -357,7 +378,7 @@ console.log("PASS CX permission review, denial, revocation, rollback, plugin and
             PresenceStore: { getStatus: () => pingDnd ? "dnd" : "online" },
             UserGuildSettingsStore: { isMuted: () => pingMuted },
             UnreadSettingNoticeStore2: { maybeAutoUpgradeChannel: upgradeChannel },
-            UserStore: { getCurrentUser: () => ({ id: me }), getUser: id => [me, sender, other].includes(id) ? { id } : undefined },
+            UserStore: { getCurrentUser: () => ({ id: activeAccount }), getUser: id => [me, sender, other].includes(id) ? { id } : undefined },
             UserProfileStore: {
                 getUserProfile: id => id === sender ? { themeColors: Object.freeze([0, 0x12abcd]), banner: "a_" + "a".repeat(32) } : undefined,
                 getGuildMemberProfile: (id, guild) => id === sender && guild === guildId ? { themeColors: [0x123, 0xffffff] } : undefined,
@@ -583,6 +604,7 @@ console.log("PASS CX permission review, denial, revocation, rollback, plugin and
             unregisterCommand(name) { delete registered[name]; },
             sendMessage(...args) {
                 if (args[0] === repeatChannel) repeated.push(args);
+                if (args[0] === "scheduled-channel") scheduledSends.push(args);
                 return "sent normally";
             },
             sendBotMessage: (channel, message) => delivered.push([channel, typeof message === "string" ? message : message.content]),
@@ -1045,6 +1067,7 @@ console.log("PASS CX permission review, denial, revocation, rollback, plugin and
         assert.equal(suggestedMarkers.size + appearanceHooks.size, 0);
         assert.equal(suggestedObserver, undefined);
         for (const [target, rule] of Object.entries(moduleBox.exports.cxAppearanceTargets)) {
+            if (rule.desktopOnly) continue;
             const appearancePort = cxCatalog.plugins.find(entry => entry.name === rule.plugin).source;
             assert.throws(() => activateCx(appearancePort, host, []), /approval/);
             const action = rule.style ? "style" : "hide";
@@ -2257,6 +2280,44 @@ console.log("PASS CX permission review, denial, revocation, rollback, plugin and
         assert.equal(acknowledged.length, 1);
 
         const guildContext = { guild: { id: guildId }, channel: { id: "guild-channel", guild_id: guildId } };
+        {
+            const port = cxCatalog.plugins.find(entry => entry.name === "ScheduledMessages").source;
+            assert.throws(() => activateCx(port, host, ["commands.register", "reply.local", "messages.send"]), /approval/);
+            selectCatalog("ScheduledMessages");
+            click(render(), "Allow for this session");
+            const schedule = registered.schedule;
+            const context = { channel: { id: "scheduled-channel" } };
+            const args = minutes => [{ name: "message", value: "Later" }, { name: "minutes", value: minutes }];
+            const runTimer = () => {
+                const [timer] = scheduleTimers.keys();
+                scheduleTimers.delete(timer);
+                timer();
+            };
+            assert.equal(schedule.execute(args(0), context), undefined);
+            assert.match(delivered.pop()[1], /Choose a delay/);
+            assert.equal(scheduleTimers.size, 0);
+            schedule.execute(args(2), context);
+            assert.deepEqual([...scheduleTimers.values()], [120000]);
+            assert.match(delivered.pop()[1], /^Scheduled for <t:\d+:t>/);
+            assert.equal(scheduledSends.length, 0);
+            runTimer();
+            await new Promise(setImmediate);
+            assert.equal(scheduledSends[0][0], context.channel.id);
+            assert.equal(scheduledSends[0][1].content, "Later");
+            schedule.execute(args(1), context);
+            assert.match(delivered.pop()[1], /Scheduled for/);
+            const repliesBeforeSwitch = delivered.length;
+            activeAccount = sender;
+            runTimer();
+            await new Promise(setImmediate);
+            assert.equal(scheduledSends.length, 1);
+            assert.equal(delivered.length, repliesBeforeSwitch);
+            activeAccount = me;
+            schedule.execute(args(1), context);
+            click(render(), "Disable ScheduledMessages");
+            assert.equal(scheduleTimers.size, 0);
+            assert.equal(registered.schedule, undefined);
+        }
         const wikiSource = cxCatalog.plugins.find(entry => entry.name === "WikiLookup").source;
         assert.throws(() => activateCx(wikiSource, host, ["commands.register", "reply.local"]), /approval/);
         assert.throws(() => parseCx(wikiSource.replace('lookup wikipedia "message"', 'lookup webhook "message"')), /Unknown CX instruction/);
@@ -2287,6 +2348,47 @@ console.log("PASS CX permission review, denial, revocation, rollback, plugin and
         assert.equal(wikiRequest.options.signal.aborted, true);
         await new Promise(setImmediate);
         assert.equal(delivered.length, replyCount);
+
+        {
+            const port = cxCatalog.plugins.find(entry => entry.name === "Translate").source;
+            assert.throws(() => activateCx(port, host, ["commands.register", "reply.local", "messages.send"]), /approval/);
+            selectCatalog("Translate");
+            click(render(), "Allow for this session");
+            const translate = registered.translate;
+            assert.ok(translate.options.some(option => option.name === "send"));
+            const args = [{ name: "text", value: "hi & bye" }];
+            const context = { channel: { id: "scheduled-channel" } };
+            const requestsBefore = translateRequest;
+            translate.execute([...args, { name: "to", value: "https://example.com" }], context);
+            assert.equal(translateRequest, requestsBefore);
+            assert.match(delivered.pop()[1], /Enter a language code/);
+            translate.execute(args, context);
+            const request = translateRequest;
+            const url = new URL(request.url);
+            assert.equal(url.origin, "https://translate.googleapis.com");
+            assert.equal(url.searchParams.get("tl"), "en");
+            assert.equal(url.searchParams.get("q"), "hi & bye");
+            assert.equal(request.options.credentials, "omit");
+            assert.equal(request.options.redirect, "error");
+            translate.execute(args, context);
+            assert.equal(translateRequest, request);
+            request.resolve({ ok: true, json: async () => [[["Hello @everyone"], [" and bye"]], null, "fr"] });
+            await new Promise(setImmediate);
+            assert.deepEqual(delivered.pop(), [context.channel.id, "**Translated from fr:** Hello ＠everyone and bye"]);
+            const sendsBefore = scheduledSends.length;
+            translate.execute([...args, { name: "to", value: "FR" }, { name: "send", value: true }], context);
+            assert.equal(new URL(translateRequest.url).searchParams.get("tl"), "fr");
+            translateRequest.resolve({ ok: true, json: async () => [[["Salut"]], null, "en"] });
+            await new Promise(setImmediate);
+            assert.equal(scheduledSends.length, sendsBefore + 1);
+            assert.equal(scheduledSends.at(-1)[1].content, "Salut");
+            translate.execute(args, context);
+            const pending = translateRequest;
+            click(render(), "Disable Translate");
+            assert.equal(pending.options.signal.aborted, true);
+            await new Promise(setImmediate);
+            assert.equal(registered.translate, undefined);
+        }
 
         selectCatalog("AtSomeone");
         click(render(), "Allow for this session");
@@ -2401,9 +2503,21 @@ console.log("PASS CX permission review, denial, revocation, rollback, plugin and
         }
         {
             const port = cxCatalog.plugins.find(entry => entry.name === "ShowPing").source;
-            assert.throws(() => activateCx(port, host, ["voice.calltime"]), /approval/);
+            assert.throws(() => activateCx(port, host, ["voice.latency"]), /approval/);
             selectCatalog("ShowPing");
+            const label = "Hide the desktop Krisp button beside the voice connection controls";
+            const krisp = (prefix = "") => find(render(), item => (desktop ? item.props["aria-label"] : item.props.label) === prefix + label);
+            if (desktop) assert.equal(krisp().props.checked, true);
+            else assert.equal(krisp(), undefined);
             click(render(), "Allow for this session");
+            if (desktop) {
+                const active = "ShowPing · ";
+                assert.match(stylesheet.textContent, /voiceButtonsContainer_.*Krisp/);
+                krisp(active).props.onChange({ currentTarget: { checked: false } });
+                assert.equal(stylesheet, undefined);
+                krisp(active).props.onChange({ currentTarget: { checked: true } });
+                assert.match(stylesheet.textContent, /voiceButtonsContainer_.*Krisp/);
+            } else assert.equal(krisp("ShowPing · "), undefined);
             const pingListeners = voiceEventListeners.get("RTC_CONNECTION_PING");
             const renderPing = channelId => {
                 let ping;
@@ -2426,7 +2540,7 @@ console.log("PASS CX permission review, denial, revocation, rollback, plugin and
             voicePingConnected = true;
             voicePingChannel = voiceTarget;
             voicePingMs = NaN;
-            assert.equal(renderPing(voiceTarget), null);
+            assert.equal(renderPing(voiceTarget), "N/A");
             voicePingMs = 24.8;
             pingListeners.forEach(listener => listener());
             assert.equal(renderPing(voiceTarget), "25 ms");
@@ -2440,8 +2554,72 @@ console.log("PASS CX permission review, denial, revocation, rollback, plugin and
             rtcListeners.forEach(listener => listener());
             assert.equal(renderPing(voiceTarget), null);
             click(render(), "Disable ShowPing");
+            assert.equal(stylesheet, undefined);
             assert.equal(pingListeners.size + rtcListeners.size, 0);
             if (!desktop) assert.equal(appearanceHooks.has(VoicePanelHeader), false);
+        }
+        {
+            const port = cxCatalog.plugins.find(entry => entry.name === "NotifyWhenMuted").source;
+            assert.throws(() => activateCx(port, host, ["voice.cameratone"]), /approval/);
+            const configured = parseCx(port.replace("use notify-when-muted", "use notify-when-muted server-mute ignore-deafened cooldown-20"));
+            assert.equal(configured.mutedVoiceOptions.cooldownSeconds, 20);
+            assert.equal(configured.mutedVoiceOptions.serverMute, true);
+            assert.equal(configured.mutedVoiceOptions.ignoreDeafened, true);
+            assert.throws(() => parseCx(port.replace("use notify-when-muted", "use notify-when-muted cooldown-61")), /Mute alert options/);
+            selectCatalog("NotifyWhenMuted");
+            click(render(), "Allow for this session");
+            assert.equal(mediaListeners.size, 1);
+            const previousVoice = currentVoice;
+            currentVoice = voiceTarget;
+            clockTime = 1_000_000;
+            const soundsBefore = queueSounds.length;
+            const change = () => mediaListeners.forEach(listener => listener());
+            speakingWhileMuted = true;
+            serverMuted = true;
+            change();
+            assert.equal(queueSounds.length, soundsBefore);
+            selfMuted = true;
+            selfDeafened = true;
+            change();
+            assert.deepEqual(queueSounds.slice(soundsBefore), ["user_leave"]);
+            clockTime += 4999;
+            change();
+            assert.equal(queueSounds.length, soundsBefore + 1);
+            clockTime++;
+            change();
+            assert.equal(queueSounds.length, soundsBefore + 2);
+            clockTime += 5000;
+            if (!desktop) {
+                settings.safeMode = { enabled: true };
+                change();
+                assert.equal(queueSounds.length, soundsBefore + 2);
+                settings.safeMode = undefined;
+            }
+            currentVoice = null;
+            change();
+            assert.equal(queueSounds.length, soundsBefore + 2);
+            click(render(), "Disable NotifyWhenMuted");
+            assert.equal(mediaListeners.size, 0);
+            let configuredAlerts = 0;
+            const stopConfigured = moduleBox.exports.bindCxMutedVoice(stores.MediaEngineStore,
+                () => true, () => { configuredAlerts++; }, configured.mutedVoiceOptions);
+            selfMuted = false;
+            change();
+            assert.equal(configuredAlerts, 0);
+            selfDeafened = false;
+            change();
+            assert.equal(configuredAlerts, 1);
+            clockTime += 19_999;
+            change();
+            assert.equal(configuredAlerts, 1);
+            clockTime++;
+            change();
+            assert.equal(configuredAlerts, 2);
+            stopConfigured();
+            assert.equal(mediaListeners.size, 0);
+            currentVoice = previousVoice;
+            clockTime = undefined;
+            speakingWhileMuted = selfMuted = serverMuted = selfDeafened = false;
         }
         {
             const port = cxCatalog.plugins.find(entry => entry.name === "AllCallTimeCounter").source;

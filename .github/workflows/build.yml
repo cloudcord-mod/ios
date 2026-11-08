@@ -16,8 +16,8 @@ jobs:
       - name: Check out shared build inputs
         uses: actions/checkout@v4
         with:
-          repository: cloudcord-mod/release-hub
-          ref: 8f93a43ee83a07ff3f46b2aee2545b46f6ecf8f8
+          repository: cloudcord-mod/hub
+          ref: 5d69429aa89e55122a816d050a95f97833ceb301
           persist-credentials: false
       - name: Check out platform source
         uses: actions/checkout@v4
